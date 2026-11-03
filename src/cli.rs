@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "apireplay")]
@@ -21,5 +21,9 @@ pub enum Commands {
         /// Target API URL
         #[arg(long)]
         target: String,
+
+        /// JSONL file to append recorded HTTP exchanges to
+        #[arg(long)]
+        output: PathBuf,
     },
 }

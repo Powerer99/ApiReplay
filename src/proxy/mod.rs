@@ -1,26 +1,23 @@
 pub mod handler;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
-use axum::{extract::DefaultBodyLimit, Router};
-use axum::routing::any;
-use reqwest::{redirect::Policy, Client, Url};
+use anyhow::Context;
+use axum::{Router, extract::DefaultBodyLimit, routing::any};
+use reqwest::{Client, Url, redirect::Policy};
+use tracing::info;
 
-use crate::proxy::handler::{proxy_handler, ProxyState};
+use crate::{
+    proxy::handler::{ProxyState, proxy_handler},
+    recording::RecordingWriter,
+};
 
-pub async fn start(
-    listen: SocketAddr,
-    target: String,
-) -> anyhow::Result<()> {
+pub async fn start(listen: SocketAddr, target: String, output: PathBuf) -> anyhow::Result<()> {
     let url = Url::parse(&target)?;
 
-    // MVP: only forward requests to loopback HTTPS servers.
-
     anyhow::ensure!(
-        url.scheme() == "http" && matches!(
-            url.host_str(),
-            Some("localhost" | "127.0.0.1" |"[::1]")
-        ),
+        url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
         "Target must be a local HTTP server (http://localhost or http://127.0.0.1 or http://[::1])"
     );
 
@@ -29,6 +26,9 @@ pub async fn start(
         "APIReplay must listen on a loopback address"
     );
 
+    let recorder = RecordingWriter::create(&output)
+        .await
+        .with_context(|| format!("failed to initialize recording output {}", output.display()))?;
     let client = Client::builder()
         .redirect(Policy::none())
         .no_proxy()
@@ -37,16 +37,17 @@ pub async fn start(
     let state = ProxyState {
         target: url,
         client,
+        recorder,
     };
 
     let app = Router::new()
         .fallback(any(proxy_handler))
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
 
-    println!("APIReplay listening on https://{listen} and forwarding to {target}");
+    info!(%listen, %target, output = %output.display(), "APIReplay recording proxy started");
 
     axum::serve(listener, app).await?;
 
