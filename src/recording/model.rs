@@ -242,9 +242,7 @@ fn collect_sensitive_json_values(value: &Value, secrets: &mut Vec<String>) {
         Value::Object(object) => {
             for (key, value) in object {
                 if is_sensitive_json_key(key) {
-                    if let Some(secret) = value.as_str().filter(|secret| !secret.is_empty()) {
-                        secrets.push(secret.to_owned());
-                    }
+                    collect_secret_leaves(value, secrets);
                 } else {
                     collect_sensitive_json_values(value, secrets);
                 }
@@ -261,6 +259,27 @@ fn collect_sensitive_json_values(value: &Value, secrets: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+fn collect_secret_leaves(value: &Value, secrets: &mut Vec<String>) {
+    match value {
+        Value::Object(items) => {
+            for (key, item) in items {
+                if !key.is_empty() {
+                    secrets.push(key.clone());
+                }
+                collect_secret_leaves(item, secrets);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_secret_leaves(item, secrets);
+            }
+        }
+        Value::String(text) if !text.is_empty() => secrets.push(text.clone()),
+        Value::String(_) => {}
+        _ => secrets.push(value.to_string()),
     }
 }
 
@@ -299,7 +318,11 @@ fn redact_known_secrets_in_json(value: &mut Value, secrets: &[String]) {
             }
             redact_known_secrets(text, secrets);
         }
-        _ => {}
+        _ => {
+            if secrets.contains(&value.to_string()) {
+                *value = Value::String(REDACTED.to_owned());
+            }
+        }
     }
 }
 
@@ -430,6 +453,25 @@ mod tests {
             assert!(!serialized.contains("quote"));
             assert!(serialized.contains("visible"));
         }
+    }
+
+    #[test]
+    fn redacts_numeric_and_container_secret_echoes() {
+        let input = json!({"password": 917364285, "echo": 917364285, "text": "id=917364285",
+            "secret": {"credential": ["nested-private", true, null]},
+            "echoes": ["nested-private", true, null], "safe": "visible"});
+        let secrets =
+            collect_sensitive_values(&HeaderMap::new(), &serde_json::to_vec(&input).unwrap());
+        let captured = capture_body_with_redactions(
+            &serde_json::to_vec(&input).unwrap(),
+            Some("application/json"),
+            &secrets,
+        );
+        let serialized = serde_json::to_string(&captured).unwrap();
+        for secret in ["917364285", "nested-private", "true", "null"] {
+            assert!(!serialized.contains(secret), "leaked {secret}");
+        }
+        assert!(serialized.contains("visible"));
     }
 
     #[test]

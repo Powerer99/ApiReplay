@@ -137,6 +137,11 @@ including request credentials echoed in a response.
 Known secret strings are also removed from JSON property names. When sanitized
 names collide, a deterministic `#2`, `#3`, ... suffix preserves each value;
 existing property names are reserved so they are not overwritten.
+Sensitive numbers, booleans and nulls are redacted wherever their values recur in
+captured application data. For sensitive objects/arrays, all scalar leaves and
+object keys are treated as secrets. This conservative policy can redact ordinary
+data with the same value (for example `true`); redacted data cannot be exactly
+reconstructed for replay. Empty strings contain no recoverable secret value.
 
 Redaction is based on recognized names and detected values. Arbitrary secrets in
 free text, form data, or unrecognized fields may still be recorded; review
