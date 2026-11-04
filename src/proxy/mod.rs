@@ -46,6 +46,7 @@ pub async fn start(listen: SocketAddr, target: String, output: PathBuf) -> anyho
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    let listen = listener.local_addr()?;
 
     info!(%listen, %target, output = %output.display(), "APIReplay recording proxy started");
 
