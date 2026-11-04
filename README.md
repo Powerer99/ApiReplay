@@ -5,9 +5,8 @@ development. It runs a recording proxy between your client and a local API,
 forwards requests to that API, and appends request/response exchanges to a JSON
 Lines (JSONL) file for inspection and debugging.
 
-The current implementation provides the `record` command. Replay and response
-comparison are planned areas represented by empty source files; they are not yet
-available as commands.
+The current implementation provides `record` and `replay`. Response comparison
+is the next milestone.
 
 ## How it works
 
@@ -161,6 +160,41 @@ recordings before sharing them.
   recording. Recording write failures are logged.
 
 ## Development
+
+## Replay against another local service
+
+```sh
+apireplay replay --input recordings.jsonl --target http://127.0.0.1:3001 --output replay.jsonl
+```
+
+Replay validates all input before sending traffic, then sends requests sequentially
+in recording order. The output must not already exist. Results contain schema
+version 1, one-based `source_index`, `outcome` (`completed`, `skipped`, `failed`),
+an optional reason, duration and the sanitized response when available. A completed
+request means an HTTP response was received, including 4xx/5xx; it does not imply
+that the response matches the baseline. Exit code 0 means all requests completed;
+2 means invalid input, an operational error, or any skipped/failed request.
+
+`--timeout-ms` bounds each request including its response stream (default 10000).
+Local HTTP targets only; redirects are returned without being followed. Bodies
+in results use the same bounded capture policy as recordings.
+
+Redacted or omitted requests are skipped, not silently sent with placeholders.
+Use `--overrides overrides.json` to supply a complete replacement request for each
+affected one-based source line. For example:
+
+```json
+{"1":{"method":"GET","path_and_query":"/health","headers":{"authorization":["Bearer your-local-test-token"]},"body":{"kind":"empty"}}}
+```
+
+Overrides are read from a local file; keep this file out of version control.
+Credentials supplied there are used only for forwarding and known-secret
+sanitization, never copied to replay result metadata. Omitted binary/oversized
+bodies cannot be recovered from a recording; provide a supported complete request
+or retain an explicit skipped result. JSON bodies are replayed semantically,
+not byte-for-byte (whitespace and property order can change).
+
+## Development checks
 
 ```sh
 cargo test --locked

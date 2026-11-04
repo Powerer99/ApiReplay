@@ -39,7 +39,7 @@ fn is_hop_header(name: &HeaderName) -> bool {
     )
 }
 
-fn filter_headers(headers: &HeaderMap) -> HeaderMap {
+pub fn filter_headers(headers: &HeaderMap) -> HeaderMap {
     let connection_tokens: Vec<String> = headers
         .get_all(CONNECTION)
         .iter()
