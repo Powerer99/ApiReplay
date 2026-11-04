@@ -155,6 +155,8 @@ recordings before sharing them.
 - The proxy does not follow upstream redirects. Hop-by-hop headers are filtered
   when forwarding traffic.
 - Successful exchanges are written after the response stream completes.
+  HEAD, 204, 304 and known empty responses are recorded on header completion,
+  without depending on the client polling a body.
   Interrupted streams and requests rejected before the handler runs may have no
   recording. Recording write failures are logged.
 

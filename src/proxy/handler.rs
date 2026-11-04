@@ -147,7 +147,7 @@ pub async fn proxy_handler(
 
     let request = state
         .client
-        .request(method, url)
+        .request(method.clone(), url)
         .headers(forwarded_headers)
         .body(body);
 
@@ -184,6 +184,30 @@ pub async fn proxy_handler(
     let response_headers = filter_headers(upstream.headers());
     let response_content_type = content_type(upstream.headers());
     known_secrets.extend(collect_sensitive_values(upstream.headers(), &[]));
+    // Hyper need not poll body streams for HEAD/204/304 (or known empty bodies).
+    // Persist these completed header-only exchanges before handing off the response.
+    if method == Method::HEAD
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+        || upstream.content_length() == Some(0)
+    {
+        scrub_request(&mut recorded_request, &known_secrets);
+        persist_completed_exchange(
+            &state.recorder,
+            started_at,
+            recorded_request,
+            RecordedResponse {
+                status: status.as_u16(),
+                headers: sanitize_headers_with_redactions(&response_headers, &known_secrets),
+                body: RecordedBody::Empty,
+            },
+        )
+        .await;
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = status;
+        *response.headers_mut() = response_headers;
+        return response;
+    }
     let response_headers_for_recording = response_headers.clone();
     let recorder = state.recorder;
 
@@ -215,13 +239,7 @@ pub async fn proxy_handler(
         }
 
         known_secrets.extend(collect_sensitive_values(&HeaderMap::new(), &captured));
-        redact_known_secrets(&mut recorded_request.path_and_query, &known_secrets);
-        for values in recorded_request.headers.values_mut() {
-            for value in values {
-                redact_known_secrets(value, &known_secrets);
-            }
-        }
-        redact_recorded_body(&mut recorded_request.body, &known_secrets);
+        scrub_request(&mut recorded_request, &known_secrets);
         let recorded_response_headers = sanitize_headers_with_redactions(
             &response_headers_for_recording,
             &known_secrets,
@@ -256,4 +274,14 @@ pub async fn proxy_handler(
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
     response
+}
+
+fn scrub_request(request: &mut RecordedRequest, secrets: &[String]) {
+    redact_known_secrets(&mut request.path_and_query, secrets);
+    for values in request.headers.values_mut() {
+        for value in values {
+            redact_known_secrets(value, secrets);
+        }
+    }
+    redact_recorded_body(&mut request.body, secrets);
 }

@@ -65,6 +65,14 @@ async fn upstream_handler(
     body: Bytes,
 ) -> Response {
     match uri.path() {
+        "/empty" | "/no-content" | "/not-modified" => Response::builder()
+            .status(match uri.path() {
+                "/no-content" => 204,
+                "/not-modified" => 304,
+                _ => 200,
+            })
+            .body(Body::empty())
+            .unwrap(),
         "/binary" => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -507,4 +515,73 @@ fn requires_output_and_rejects_nonlocal_addresses() {
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
     }
+}
+
+#[tokio::test]
+async fn records_head_and_bodyless_responses_once() {
+    let (upstream, task) = spawn_upstream().await;
+    let proxy = unused_loopback_address();
+    let output = TempRecording::new("bodyless");
+    let _process = spawn_proxy(proxy, upstream, &output.0);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    send_when_ready(&client, &format!("http://{proxy}/ready"))
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    for (path, status) in [
+        ("/empty", 200),
+        ("/no-content", 204),
+        ("/not-modified", 304),
+    ] {
+        let response = client
+            .get(format!("http://{proxy}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+    let mut tasks = Vec::new();
+    for id in 0..8 {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = client
+                .head(format!("http://{proxy}/head/{id}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 201);
+            assert!(response.bytes().await.unwrap().is_empty());
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let records = read_records_when_ready(&output.0, 12).await;
+    assert_eq!(records.len(), 12);
+    for record in records
+        .iter()
+        .filter(|r| r["request"]["path_and_query"] != "/ready")
+    {
+        assert_eq!(record["response"]["body"]["kind"], "empty");
+        assert_eq!(record["schema_version"], 1);
+        assert!(record["recorded_at_unix_ms"].as_u64().unwrap() > 0);
+        assert!(record["duration_ms"].is_number());
+    }
+    for id in 0..8 {
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["request"]["path_and_query"] == format!("/head/{id}")
+                    && r["request"]["method"] == "HEAD")
+                .count(),
+            1
+        );
+    }
+    task.abort();
 }
