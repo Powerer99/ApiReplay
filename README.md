@@ -134,6 +134,9 @@ authorization and cookie headers, headers ending in `-token`, `-secret`, or
 `password`, `access_token`, `refresh_token`, `api_key`, and `client_secret`.
 Detected secret strings are also scrubbed from captured content where available,
 including request credentials echoed in a response.
+Known secret strings are also removed from JSON property names. When sanitized
+names collide, a deterministic `#2`, `#3`, ... suffix preserves each value;
+existing property names are reserved so they are not overwritten.
 
 Redaction is based on recognized names and detected values. Arbitrary secrets in
 free text, form data, or unrecognized fields may still be recorded; review
