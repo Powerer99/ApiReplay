@@ -5,8 +5,7 @@ development. It runs a recording proxy between your client and a local API,
 forwards requests to that API, and appends request/response exchanges to a JSON
 Lines (JSONL) file for inspection and debugging.
 
-The current implementation provides `record` and `replay`. Response comparison
-is the next milestone.
+The CLI provides `record`, `replay`, and `compare` for local HTTP services.
 
 ## How it works
 
@@ -159,8 +158,6 @@ recordings before sharing them.
   Interrupted streams and requests rejected before the handler runs may have no
   recording. Recording write failures are logged.
 
-## Development
-
 ## Replay against another local service
 
 ```sh
@@ -195,6 +192,32 @@ or retain an explicit skipped result. JSON bodies are replayed semantically,
 not byte-for-byte (whitespace and property order can change).
 
 ## Development checks
+
+## Compare replay results
+
+```sh
+apireplay compare --baseline recordings.jsonl --actual replay.jsonl --output comparison.json
+```
+
+Comparison correlates by one-based source index, so repeated URLs remain separate.
+It compares status, headers, text and JSON structure; JSON object order is ignored,
+but array order matters. Reports list field/JSON Pointer locations and change
+categories without printing response values. The output file must not exist.
+
+Date, Server and transport headers (Connection, Content-Length, Transfer-Encoding,
+Keep-Alive, Trailer, TE, Upgrade and proxy authentication headers) are ignored by
+default. Explicitly ignore additional fields with repeatable `--ignore-header`
+and `--ignore-json-path /timestamp` options. The report records these exclusions.
+An explicit exclusion applies to both inputs; matches are only for the remaining
+fields. JSON pointers use `~0` for `~` and `~1` for `/`.
+
+Exit codes: **0** means all compared exchanges match; **1** means differences;
+**2** means invalid input or incomplete comparison. Missing/extra, skipped/failed,
+omitted or unresolved redacted responses are incomplete, never full matches.
+Credentials in requests may require replay overrides; unresolved response secrets
+remain incomparable unless the corresponding fields are explicitly excluded.
+
+## Development validation
 
 ```sh
 cargo test --locked
