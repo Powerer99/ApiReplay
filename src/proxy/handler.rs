@@ -18,7 +18,7 @@ use tracing::{error, info};
 use crate::recording::{
     RecordedBody, RecordedExchange, RecordedRequest, RecordedResponse, RecordingWriter,
     capture_body, capture_body_with_redactions, collect_sensitive_values, is_sensitive_name,
-    model::{MAX_RECORDED_BODY_BYTES, OmissionReason},
+    model::{MAX_RECORDED_BODY_BYTES, OmissionReason, redact_recorded_body},
     redact_known_secrets, sanitize_headers_with_redactions,
 };
 
@@ -41,10 +41,10 @@ fn is_hop_header(name: &HeaderName) -> bool {
 
 fn filter_headers(headers: &HeaderMap) -> HeaderMap {
     let connection_tokens: Vec<String> = headers
-        .get(CONNECTION)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .split(',')
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
         .map(|value| value.trim().to_ascii_lowercase())
         .collect();
 
@@ -129,7 +129,7 @@ pub async fn proxy_handler(
     let forwarded_headers = filter_headers(&headers);
     let mut known_secrets = collect_sensitive_values(&headers, &body);
     let path_and_query = sanitize_path_and_query(&uri, &mut known_secrets);
-    let recorded_request = RecordedRequest {
+    let mut recorded_request = RecordedRequest {
         method: method.to_string(),
         path_and_query,
         headers: sanitize_headers_with_redactions(&forwarded_headers, &known_secrets),
@@ -162,7 +162,11 @@ pub async fn proxy_handler(
                 recorded_request,
                 RecordedResponse {
                     status: StatusCode::BAD_GATEWAY.as_u16(),
-                    headers: Default::default(),
+                    headers: [(
+                        "content-type".to_owned(),
+                        vec!["text/plain; charset=utf-8".to_owned()],
+                    )]
+                    .into(),
                     body: capture_body(&response_body, Some("text/plain; charset=utf-8")),
                 },
             )
@@ -211,11 +215,18 @@ pub async fn proxy_handler(
         }
 
         known_secrets.extend(collect_sensitive_values(&HeaderMap::new(), &captured));
+        redact_known_secrets(&mut recorded_request.path_and_query, &known_secrets);
+        for values in recorded_request.headers.values_mut() {
+            for value in values {
+                redact_known_secrets(value, &known_secrets);
+            }
+        }
+        redact_recorded_body(&mut recorded_request.body, &known_secrets);
         let recorded_response_headers = sanitize_headers_with_redactions(
             &response_headers_for_recording,
             &known_secrets,
         );
-        let response_body = if too_large {
+        let mut response_body = if too_large {
             RecordedBody::Omitted {
                 content_type: response_content_type,
                 reason: OmissionReason::TooLarge,
@@ -227,6 +238,7 @@ pub async fn proxy_handler(
                 &known_secrets,
             )
         };
+        redact_recorded_body(&mut response_body, &known_secrets);
         persist_completed_exchange(
             &recorder,
             started_at,

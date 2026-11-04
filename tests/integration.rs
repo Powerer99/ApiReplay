@@ -137,13 +137,14 @@ fn spawn_proxy(listen: SocketAddr, target: SocketAddr, output: &PathBuf) -> Chil
         ])
         .arg(output)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("proxy process should start");
     ChildGuard(child)
 }
 
 async fn send_when_ready(client: &reqwest::Client, request_url: &str) -> reqwest::Response {
+    let mut last_error = None;
     for _ in 0..100 {
         match client
             .post(request_url)
@@ -153,15 +154,19 @@ async fn send_when_ready(client: &reqwest::Client, request_url: &str) -> reqwest
                 "Bearer request-secret-token",
             )
             .header(header::COOKIE.as_str(), "session=request-secret-cookie")
-            .body(r#"{"username":"alice","nested":{"password":"request-secret-password"}}"#)
+            .header("x-echo", "response-secret-token")
+            .body(r#"{"username":"alice","echo":"response-secret-token","nested":{"password":"request-secret-password"}}"#)
             .send()
             .await
         {
             Ok(response) => return response,
-            Err(_) => sleep(Duration::from_millis(25)).await,
+            Err(error) => {
+                last_error = Some(error);
+                sleep(Duration::from_millis(25)).await;
+            }
         }
     }
-    panic!("proxy did not become ready at {request_url}");
+    panic!("proxy did not become ready at {request_url}: {last_error:?}");
 }
 
 async fn read_records_when_ready(path: &PathBuf, minimum_lines: usize) -> Vec<Value> {
@@ -210,7 +215,7 @@ async fn records_sanitized_bounded_exchanges_and_concurrent_requests() {
     let proxy = unused_loopback_address();
     let output = TempRecording::new("exchanges");
     let _proxy_process = spawn_proxy(proxy, upstream, &output.0);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
     let response = send_when_ready(
         &client,
@@ -249,6 +254,22 @@ async fn records_sanitized_bounded_exchanges_and_concurrent_requests() {
     );
 
     let concurrent_count = 12;
+    let oversized_request = client
+        .post(format!("http://{proxy}/rejected"))
+        .body(vec![b'x'; 10 * RECORDING_LIMIT + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized_request.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let accepted_request = client
+        .post(format!("http://{proxy}/omitted-request"))
+        .header("content-type", "text/plain")
+        .body(vec![b'x'; RECORDING_LIMIT + 1])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted_request.status(), StatusCode::CREATED);
+    accepted_request.bytes().await.unwrap();
     let mut tasks = Vec::with_capacity(concurrent_count);
     for index in 0..concurrent_count {
         let client = client.clone();
@@ -259,17 +280,23 @@ async fn records_sanitized_bounded_exchanges_and_concurrent_requests() {
                 .await
                 .expect("concurrent request should succeed")
                 .error_for_status()
-                .expect("concurrent response should be successful");
+                .expect("concurrent response should be successful")
+                .bytes()
+                .await
+                .expect("concurrent response body should finish");
         }));
     }
     for task in tasks {
         task.await.expect("concurrent request task should finish");
     }
 
-    let expected_records = 3 + concurrent_count;
+    let expected_records = 4 + concurrent_count;
     let records = read_records_when_ready(&output.0, expected_records).await;
     assert_eq!(records.len(), expected_records);
     assert!(records.iter().all(|record| record["schema_version"] == 1));
+    let omitted = &record_for_path(&records, "/omitted-request")["request"]["body"];
+    assert_eq!(omitted["reason"], "too_large");
+    assert!(omitted.get("content").is_none());
 
     let successful_record = record_for_path(&records, "/users");
     let serialized = successful_record.to_string();
@@ -277,6 +304,17 @@ async fn records_sanitized_bounded_exchanges_and_concurrent_requests() {
     assert!(serialized.contains("alice"));
     assert!(serialized.contains("[REDACTED]"));
     assert!(successful_record["duration_ms"].is_number());
+    assert!(successful_record["recorded_at_unix_ms"].as_u64().unwrap() > 0);
+    assert_eq!(successful_record["request"]["method"], "POST");
+    assert_eq!(successful_record["response"]["status"], 201);
+    assert_eq!(
+        successful_record["request"]["headers"]["x-echo"][0],
+        "[REDACTED]"
+    );
+    assert_eq!(
+        successful_record["request"]["body"]["content"]["echo"],
+        "[REDACTED]"
+    );
 
     let whole_file = tokio::fs::read_to_string(&output.0)
         .await
@@ -319,7 +357,7 @@ async fn records_client_visible_bad_gateway_when_upstream_is_unavailable() {
     let proxy = unused_loopback_address();
     let output = TempRecording::new("bad-gateway");
     let _proxy_process = spawn_proxy(proxy, unavailable_upstream, &output.0);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
     let response = send_when_ready(&client, &format!("http://{proxy}/unavailable")).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -327,6 +365,10 @@ async fn records_client_visible_bad_gateway_when_upstream_is_unavailable() {
     let records = read_records_when_ready(&output.0, 1).await;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["schema_version"], 1);
+    assert_eq!(
+        records[0]["response"]["headers"]["content-type"][0],
+        "text/plain; charset=utf-8"
+    );
     assert!(records[0].to_string().contains("unavailable"));
     assert!(records[0].to_string().contains("502"));
 }
@@ -361,4 +403,108 @@ fn refuses_to_start_when_output_parent_does_not_exist() {
         stderr.contains("output") || stderr.contains("record"),
         "startup error should identify the recording destination: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn streams_before_upstream_finishes_and_records_after_completion() {
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stream_gate = gate.clone();
+    let app = Router::new().route(
+        "/stream",
+        axum::routing::get(move || {
+            let gate = stream_gate.clone();
+            async move {
+                Response::builder()
+                    .header("content-type", "text/plain")
+                    .body(Body::from_stream(async_stream::stream! {
+                        yield Ok::<_, std::io::Error>(Bytes::from_static(b"first"));
+                        gate.notified().await;
+                        yield Ok::<_, std::io::Error>(Bytes::from_static(b"last"));
+                    }))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let proxy = unused_loopback_address();
+    let output = TempRecording::new("stream");
+    let _proxy_process = spawn_proxy(proxy, target, &output.0);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    // A 404 readiness exchange also verifies ordinary upstream statuses are recorded.
+    send_when_ready(&client, &format!("http://{proxy}/ready"))
+        .await
+        .bytes()
+        .await
+        .unwrap();
+    read_records_when_ready(&output.0, 1).await;
+    let mut response = client
+        .get(format!("http://{proxy}/stream"))
+        .send()
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+        .await
+        .expect("first chunk must arrive before the upstream is released")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.as_ref(), b"first");
+    assert_eq!(
+        tokio::fs::read_to_string(&output.0)
+            .await
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    gate.notify_one();
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"last");
+    let records = read_records_when_ready(&output.0, 2).await;
+    assert_eq!(
+        record_for_path(&records, "/stream")["response"]["body"]["content"],
+        "firstlast"
+    );
+    upstream_task.abort();
+}
+
+#[test]
+fn requires_output_and_rejects_nonlocal_addresses() {
+    for (args, expected) in [
+        (
+            vec!["record", "--target", "http://127.0.0.1:3000"],
+            "--output",
+        ),
+        (
+            vec![
+                "record",
+                "--target",
+                "http://example.com",
+                "--output",
+                "unused.jsonl",
+            ],
+            "local HTTP",
+        ),
+        (
+            vec![
+                "record",
+                "--target",
+                "http://127.0.0.1:3000",
+                "--listen",
+                "0.0.0.0:8080",
+                "--output",
+                "unused.jsonl",
+            ],
+            "loopback",
+        ),
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_apireplay"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+    }
 }
