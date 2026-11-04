@@ -23,6 +23,21 @@ async fn run() -> anyhow::Result<u8> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Compare {
+            baseline,
+            actual,
+            output,
+            ignore_header,
+            ignore_json_path,
+        } => {
+            return apireplay::diff::comparator::run(
+                &baseline,
+                &actual,
+                output.as_deref(),
+                &ignore_header,
+                &ignore_json_path,
+            );
+        }
         Commands::Replay {
             input,
             target,

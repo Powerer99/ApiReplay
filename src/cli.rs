@@ -12,6 +12,21 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Compare recorded responses with correlated replay results
+    Compare {
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long)]
+        actual: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Ignore a response header (repeatable, case insensitive)
+        #[arg(long)]
+        ignore_header: Vec<String>,
+        /// Ignore a JSON body field by JSON Pointer (repeatable)
+        #[arg(long)]
+        ignore_json_path: Vec<String>,
+    },
     /// Replay supported recorded requests against a local HTTP service
     Replay {
         #[arg(long)]
