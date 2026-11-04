@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    net::SocketAddr,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -49,6 +49,7 @@ impl TempRecording {
 impl Drop for TempRecording {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(self.0.with_extension("log"));
     }
 }
 
@@ -124,31 +125,46 @@ async fn spawn_upstream() -> (SocketAddr, JoinHandle<()>) {
     (address, task)
 }
 
-fn unused_loopback_address() -> SocketAddr {
-    let listener = StdTcpListener::bind("127.0.0.1:0").expect("temporary port should bind");
-    let address = listener
-        .local_addr()
-        .expect("temporary listener should have an address");
-    drop(listener);
-    address
-}
-
-fn spawn_proxy(listen: SocketAddr, target: SocketAddr, output: &PathBuf) -> ChildGuard {
+async fn spawn_proxy(target: SocketAddr, output: &PathBuf) -> (SocketAddr, ChildGuard) {
+    let log_path = output.with_extension("log");
+    let log = std::fs::File::create(&log_path).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_apireplay"))
         .args([
             "record",
             "--listen",
-            &listen.to_string(),
+            "127.0.0.1:0",
             "--target",
             &format!("http://{target}"),
             "--output",
         ])
         .arg(output)
-        .stdout(Stdio::null())
+        .env("NO_COLOR", "1")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::from(log))
         .stderr(Stdio::inherit())
         .spawn()
         .expect("proxy process should start");
-    ChildGuard(child)
+    let mut child = ChildGuard(child);
+    for _ in 0..400 {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "proxy exited before startup; inspect {log_path:?}"
+        );
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .unwrap_or_default();
+        if let Some((_, suffix)) = log.split_once("listen=127.0.0.1:") {
+            let port: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+            let address: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            assert_ne!(address.port(), 0);
+            return (address, child);
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "proxy did not report its bound address: {}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
 }
 
 async fn send_when_ready(client: &reqwest::Client, request_url: &str) -> reqwest::Response {
@@ -181,16 +197,56 @@ async fn read_records_when_ready(path: &PathBuf, minimum_lines: usize) -> Vec<Va
     for _ in 0..100 {
         if let Ok(contents) = tokio::fs::read_to_string(path).await {
             let lines = contents.lines().collect::<Vec<_>>();
-            if lines.len() >= minimum_lines {
-                return lines
+            if lines.len() >= minimum_lines && contents.ends_with('\n') {
+                let parsed = lines
                     .into_iter()
-                    .map(|line| serde_json::from_str(line).expect("each JSONL line should parse"))
-                    .collect();
+                    .map(serde_json::from_str)
+                    .collect::<Result<Vec<Value>, _>>();
+                if let Ok(records) = parsed {
+                    return records;
+                }
             }
         }
         sleep(Duration::from_millis(25)).await;
     }
     panic!("recording did not contain {minimum_lines} lines in time");
+}
+
+#[tokio::test]
+async fn parallel_proxy_startup_keeps_ports_and_recordings_isolated() {
+    let (upstream, upstream_task) = spawn_upstream().await;
+    let mut starts = tokio::task::JoinSet::new();
+    for index in 0..12 {
+        starts.spawn(async move {
+            let output = TempRecording::new("isolated");
+            let (address, child) = spawn_proxy(upstream, &output.0).await;
+            (index, address, child, output)
+        });
+    }
+    let mut proxies = Vec::new();
+    while let Some(proxy) = starts.join_next().await {
+        proxies.push(proxy.unwrap());
+    }
+    let addresses: std::collections::BTreeSet<_> =
+        proxies.iter().map(|(_, address, _, _)| *address).collect();
+    assert_eq!(addresses.len(), 12);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (index, address, _, output) in &proxies {
+        let path = format!("/isolated/{index}");
+        send_when_ready(&client, &format!("http://{address}{path}"))
+            .await
+            .bytes()
+            .await
+            .unwrap();
+        let records = read_records_when_ready(&output.0, 1).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["request"]["path_and_query"], path);
+    }
+    upstream_task.abort();
 }
 
 fn record_for_path<'a>(records: &'a [Value], path: &str) -> &'a Value {
@@ -220,10 +276,13 @@ fn json_paths_containing(value: &Value, needle: &str, path: &str, found: &mut Ve
 #[tokio::test]
 async fn records_sanitized_bounded_exchanges_and_concurrent_requests() {
     let (upstream, upstream_task) = spawn_upstream().await;
-    let proxy = unused_loopback_address();
     let output = TempRecording::new("exchanges");
-    let _proxy_process = spawn_proxy(proxy, upstream, &output.0);
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (proxy, _proxy_process) = spawn_proxy(upstream, &output.0).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
 
     let response = send_when_ready(
         &client,
@@ -361,11 +420,22 @@ async fn records_sanitized_bounded_exchanges_and_concurrent_requests() {
 
 #[tokio::test]
 async fn records_client_visible_bad_gateway_when_upstream_is_unavailable() {
-    let unavailable_upstream = unused_loopback_address();
-    let proxy = unused_loopback_address();
+    // Keep ownership of the failing endpoint: another parallel test cannot claim it.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable_upstream = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        }
+    });
     let output = TempRecording::new("bad-gateway");
-    let _proxy_process = spawn_proxy(proxy, unavailable_upstream, &output.0);
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (proxy, _proxy_process) = spawn_proxy(unavailable_upstream, &output.0).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
 
     let response = send_when_ready(&client, &format!("http://{proxy}/unavailable")).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -379,12 +449,13 @@ async fn records_client_visible_bad_gateway_when_upstream_is_unavailable() {
     );
     assert!(records[0].to_string().contains("unavailable"));
     assert!(records[0].to_string().contains("502"));
+    upstream_task.abort();
 }
 
 #[test]
 fn refuses_to_start_when_output_parent_does_not_exist() {
-    let listen = unused_loopback_address();
-    let target = unused_loopback_address();
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let target: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let missing_parent = std::env::temp_dir().join(format!(
         "apireplay-missing-parent-{}-{}",
         std::process::id(),
@@ -438,10 +509,13 @@ async fn streams_before_upstream_finishes_and_records_after_completion() {
     let upstream_task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let proxy = unused_loopback_address();
     let output = TempRecording::new("stream");
-    let _proxy_process = spawn_proxy(proxy, target, &output.0);
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let (proxy, _proxy_process) = spawn_proxy(target, &output.0).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     // A 404 readiness exchange also verifies ordinary upstream statuses are recorded.
     send_when_ready(&client, &format!("http://{proxy}/ready"))
         .await
@@ -520,9 +594,8 @@ fn requires_output_and_rejects_nonlocal_addresses() {
 #[tokio::test]
 async fn records_head_and_bodyless_responses_once() {
     let (upstream, task) = spawn_upstream().await;
-    let proxy = unused_loopback_address();
     let output = TempRecording::new("bodyless");
-    let _process = spawn_proxy(proxy, upstream, &output.0);
+    let (proxy, _process) = spawn_proxy(upstream, &output.0).await;
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))

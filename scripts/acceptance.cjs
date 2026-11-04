@@ -52,11 +52,6 @@ async function listen(server) {
   await once(server, 'listening'); return server.address().port;
 }
 
-async function unusedPort() {
-  const server = net.createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
-}
-
 async function command(args, expected) {
   const child = spawn(binary, args, { windowsHide: true }); children.push(child);
   let stdout = '', stderr = '', timedOut = false;
@@ -70,18 +65,15 @@ async function command(args, expected) {
 }
 
 async function proxy(target, filename) {
-  const port = await unusedPort(), output = artifact(filename);
+  const output = artifact(filename);
   const log = fs.openSync(artifact(filename + '.log'), 'w'); handles.push(log);
-  const child = spawn(binary, ['record', '--listen', `127.0.0.1:${port}`, '--target', target, '--output', output], { windowsHide: true, stdio: ['ignore', log, log] });
+  const child = spawn(binary, ['record', '--listen', '127.0.0.1:0', '--target', target, '--output', output], { windowsHide: true, env: { ...process.env, NO_COLOR: '1', RUST_LOG: 'info' }, stdio: ['ignore', log, log] });
   children.push(child);
-  await until(() => new Promise(resolve => {
+  const port = await until(() => {
     if (child.exitCode !== null) throw new Error('proxy exited during startup');
-    const socket = net.connect({ host: '127.0.0.1', port });
-    socket.setTimeout(200);
-    socket.on('connect', () => { socket.destroy(); resolve(true); });
-    socket.on('error', () => { socket.destroy(); resolve(false); });
-    socket.on('timeout', () => { socket.destroy(); resolve(false); });
-  }), 'proxy startup');
+    const match = fs.readFileSync(artifact(filename + '.log'), 'utf8').match(/listen=127\.0\.0\.1:(\d+)/);
+    return match && Number(match[1]);
+  }, 'proxy startup');
   return { port, output, child };
 }
 
@@ -194,7 +186,8 @@ async function main() {
     assert.equal(await response, 'firstlast'); await recorded(probes.output, ++count);
   });
   await check('upstream connection failure produces a recorded 502', async () => {
-    const unavailable = await unusedPort(); const failed = await proxy(`http://127.0.0.1:${unavailable}`, '502.jsonl');
+    const unavailable = await listen(net.createServer(socket => socket.destroy()));
+    const failed = await proxy(`http://127.0.0.1:${unavailable}`, '502.jsonl');
     assert.equal((await request(failed.port, 'GET', '/unavailable')).status, 502);
     assert.equal((await recorded(failed.output, 1))[0].response.status, 502);
   });
@@ -226,7 +219,7 @@ async function main() {
       if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill(); await Promise.race([exited, delay(5000)]); }
     }
     for (const handle of handles) fs.closeSync(handle);
-    for (const server of servers) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+    for (const server of servers) { server.closeAllConnections?.(); await new Promise(resolve => server.close(resolve)); }
     const report = {
       commit: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).trim(),
       workingTree: execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8', windowsHide: true }),
