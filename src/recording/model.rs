@@ -267,8 +267,21 @@ fn collect_sensitive_json_values(value: &Value, secrets: &mut Vec<String>) {
 fn redact_known_secrets_in_json(value: &mut Value, secrets: &[String]) {
     match value {
         Value::Object(object) => {
-            for value in object.values_mut() {
-                redact_known_secrets_in_json(value, secrets);
+            let original = std::mem::take(object);
+            let reserved: std::collections::BTreeSet<_> = original.keys().cloned().collect();
+            for (key, mut item) in original {
+                let mut sanitized = key.clone();
+                redact_known_secrets(&mut sanitized, secrets);
+                let base = sanitized.clone();
+                let mut suffix = 2;
+                while object.contains_key(&sanitized)
+                    || (sanitized != key && reserved.contains(&sanitized))
+                {
+                    sanitized = format!("{base}#{suffix}");
+                    suffix += 1;
+                }
+                redact_known_secrets_in_json(&mut item, secrets);
+                object.insert(sanitized, item);
             }
         }
         Value::Array(items) => {
@@ -276,7 +289,16 @@ fn redact_known_secrets_in_json(value: &mut Value, secrets: &[String]) {
                 redact_known_secrets_in_json(item, secrets);
             }
         }
-        Value::String(text) => redact_known_secrets(text, secrets),
+        Value::String(text) => {
+            // Decode embedded JSON before sanitizing so escaped keys are covered too.
+            if let Ok(mut embedded) = serde_json::from_str::<Value>(text)
+                && (embedded.is_object() || embedded.is_array())
+            {
+                redact_known_secrets_in_json(&mut embedded, secrets);
+                *text = embedded.to_string();
+            }
+            redact_known_secrets(text, secrets);
+        }
         _ => {}
     }
 }
@@ -371,6 +393,44 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn redacts_json_keys_and_preserves_colliding_values() {
+        let mut value = json!({"demo-key-secret": "first", "[REDACTED]": "second", "nested": [{"demo-key-secret": "third"}]});
+        redact_known_secrets_in_json(&mut value, &["demo-key-secret".into()]);
+        assert!(!value.to_string().contains("demo-key-secret"));
+        assert_eq!(value["[REDACTED]"], "second");
+        assert_eq!(value["[REDACTED]#2"], "first");
+        assert_eq!(value["nested"][0]["[REDACTED]"], "third");
+    }
+
+    #[test]
+    fn scrubs_cross_direction_keys_and_escaped_embedded_json() {
+        let request = json!({"password": "request-secret", "response-secret": "visible"});
+        let response = json!({"token": "response-secret", "request-secret": [{"quote\"secret": "visible"}], "secret": "quote\"secret"});
+        let mut secrets =
+            collect_sensitive_values(&HeaderMap::new(), &serde_json::to_vec(&request).unwrap());
+        secrets.extend(collect_sensitive_values(
+            &HeaderMap::new(),
+            &serde_json::to_vec(&response).unwrap(),
+        ));
+        for input in [
+            request,
+            response.clone(),
+            json!({"echo": response.to_string()}),
+        ] {
+            let body = capture_body_with_redactions(
+                &serde_json::to_vec(&input).unwrap(),
+                Some("application/json"),
+                &secrets,
+            );
+            let serialized = serde_json::to_string(&body).unwrap();
+            assert!(!serialized.contains("request-secret"));
+            assert!(!serialized.contains("response-secret"));
+            assert!(!serialized.contains("quote"));
+            assert!(serialized.contains("visible"));
+        }
+    }
 
     #[test]
     fn sanitizes_credential_headers_case_insensitively() {
