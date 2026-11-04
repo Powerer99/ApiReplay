@@ -154,14 +154,26 @@ pub fn capture_body_with_redactions(
     secrets: &[String],
 ) -> RecordedBody {
     let mut body = capture_body(bytes, content_type);
+    redact_recorded_body(&mut body, secrets);
+    body
+}
 
-    match &mut body {
+pub fn redact_recorded_body(body: &mut RecordedBody, secrets: &[String]) {
+    match body {
+        RecordedBody::Text { content_type, .. }
+        | RecordedBody::Json { content_type, .. }
+        | RecordedBody::Omitted { content_type, .. } => {
+            if let Some(value) = content_type {
+                redact_known_secrets(value, secrets);
+            }
+        }
+        RecordedBody::Empty => {}
+    }
+    match body {
         RecordedBody::Text { content, .. } => redact_known_secrets(content, secrets),
         RecordedBody::Json { content, .. } => redact_known_secrets_in_json(content, secrets),
         RecordedBody::Empty | RecordedBody::Omitted { .. } => {}
     }
-
-    body
 }
 
 pub fn collect_sensitive_values(headers: &HeaderMap, body: &[u8]) -> Vec<String> {
@@ -464,6 +476,34 @@ mod tests {
         let sanitized = sanitize_headers_with_redactions(&response_headers, &secrets);
 
         assert_eq!(sanitized["x-debug-token"], [REDACTED]);
+    }
+
+    #[test]
+    fn captures_text_and_json_at_the_limit_and_redacts_metadata() {
+        let text = vec![b'x'; MAX_RECORDED_BODY_BYTES];
+        assert!(matches!(capture_body(&text, Some("text/plain")),
+            RecordedBody::Text { content, .. } if content.len() == MAX_RECORDED_BODY_BYTES));
+        let json = format!("\"{}\"", "x".repeat(MAX_RECORDED_BODY_BYTES - 2));
+        assert!(matches!(
+            capture_body(json.as_bytes(), Some("application/json")),
+            RecordedBody::Json { .. }
+        ));
+        for bytes in [
+            b"hello".to_vec(),
+            vec![0xff],
+            vec![b'x'; MAX_RECORDED_BODY_BYTES + 1],
+        ] {
+            let body = capture_body_with_redactions(
+                &bytes,
+                Some("text/plain; boundary=private-value"),
+                &["private-value".to_owned()],
+            );
+            assert!(
+                !serde_json::to_string(&body)
+                    .unwrap()
+                    .contains("private-value")
+            );
+        }
     }
 
     #[test]
