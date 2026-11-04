@@ -191,8 +191,6 @@ bodies cannot be recovered from a recording; provide a supported complete reques
 or retain an explicit skipped result. JSON bodies are replayed semantically,
 not byte-for-byte (whitespace and property order can change).
 
-## Development checks
-
 ## Compare replay results
 
 ```sh
@@ -222,7 +220,9 @@ remain incomparable unless the corresponding fields are explicitly excluded.
 ```sh
 cargo test --locked
 cargo fmt --check
-cargo clippy --locked --all-targets
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+node scripts/acceptance.cjs
 ```
 
 Unit tests cover body capture, redaction, and JSONL storage. Integration tests
@@ -230,10 +230,33 @@ start local upstream servers and a proxy process to exercise recording,
 concurrent traffic, body limits for recording, upstream failures, and invalid
 output destinations.
 
+The acceptance script requires Node.js 24 and Cargo. It builds the actual binary,
+starts two local test APIs and recording proxies, verifies record/replay/compare,
+then deliberately changes responses to prove mismatches are detected. It also
+checks the historical secret-leak and HEAD regressions, concurrent recording,
+streaming, body limits, 502 handling and invalid/incomplete input. All network
+and process waits are bounded and test services are stopped on failure.
+
+Evidence is saved under `target/acceptance/<timestamp>/`: original recordings,
+replay results, match/mismatch/incomplete reports, command exit codes and logs,
+plus `results.json` identifying the tested commit, working-tree state and binary
+SHA-256. All credentials in the demonstration are synthetic. Run from a clean
+checkout to obtain evidence tied to an exact commit. GitHub Actions runs the same
+checks on Windows and Linux and uploads evidence artifacts for each run.
+
+This milestone supports local HTTP and schema version 1. HTTPS/remote services,
+file rotation, compression and recovery of removed secrets or omitted bytes are
+outside the supported scope. Interrupted streams may be unrecorded; redaction is
+name/value based, not a guarantee that arbitrary unrecognized text contains no
+secrets. Replay and comparison report missing information explicitly.
+
 | Location | Purpose |
 | --- | --- |
 | `src/main.rs`, `src/cli.rs` | Executable entry point and command-line arguments. |
 | `src/proxy/` | Local HTTP proxy setup, forwarding, and capture. |
 | `src/recording/` | Recording schema, sanitization, and JSONL storage. |
-| `src/replay/`, `src/diff/` | Empty placeholders for future functionality. |
+| `src/replay/`, `src/diff/` | Ordered replay, result schema and response comparison. |
 | `tests/integration.rs` | End-to-end tests against local HTTP servers. |
+| `tests/replay.rs` | CLI replay, credential overrides, validation and failure tests. |
+| `scripts/acceptance.cjs` | Independent real-binary acceptance proof and artifacts. |
+| `.github/workflows/ci.yml` | Windows/Linux validation and evidence upload. |
